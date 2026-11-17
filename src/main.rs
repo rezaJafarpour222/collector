@@ -27,7 +27,6 @@ async fn main() -> Result<()> {
 
     let cfg = Arc::new(config::Config::from_env()?);
 
-    // Start health server FIRST so Runflare's probe passes within seconds.
     tokio::spawn(serve_health());
 
     match run_job(&cfg).await {
@@ -169,8 +168,6 @@ async fn run_job(cfg: &Arc<config::Config>) -> Result<()> {
     Ok(())
 }
 
-/// HTTP server on $PORT. Answers 200 OK to every request so Runflare's
-/// health check passes. Starts immediately at boot, runs forever.
 async fn serve_health() {
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -183,7 +180,7 @@ async fn serve_health() {
             l
         }
         Err(e) => {
-            error!(port, error = %e, "failed to bind health port — container will likely restart");
+            error!(port, error = %e, "failed to bind health port");
             return;
         }
     };
