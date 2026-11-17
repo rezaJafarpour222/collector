@@ -1,13 +1,12 @@
 
 # ---------- Build stage ----------
-FROM rust:1.82-slim-bookworm AS builder
+FROM rust:1.88-slim-bookworm AS builder
 
 WORKDIR /src
 
-# OpenSSL headers needed by reqwest's default-tls
+# rustls needs no OpenSSL; only pkg-config for build scripts
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev ca-certificates \
+ && apt-get install -y --no-install-recommends pkg-config \
  && rm -rf /var/lib/apt/lists/*
 
 # 1) Cache dependency compilation
@@ -25,9 +24,9 @@ RUN cargo build --release \
 # ---------- Runtime stage ----------
 FROM debian:bookworm-slim
 
+# ca-certificates only — rustls uses the system CA bundle
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 \
+ && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 10001 --shell /usr/sbin/nologin app
 
