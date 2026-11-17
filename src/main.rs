@@ -10,6 +10,7 @@ use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use upload::Uploader;
@@ -26,31 +27,28 @@ async fn main() -> Result<()> {
 
     let cfg = Arc::new(config::Config::from_env()?);
 
-    // Run the job; log success or failure, but never let the process exit.
+    // Start health server FIRST so Runflare's probe passes within seconds.
+    tokio::spawn(serve_health());
+
     match run_job(&cfg).await {
         Ok(()) => info!("job finished successfully"),
         Err(e) => error!(error = %format!("{e:#}"), "job failed"),
     }
 
-    // Park forever. Container stays `Running` with ~0% CPU. Kill the container
-    // (or the orchestrator's lifecycle) to stop it.
-    info!("idling — container stays up; kill it to exit");
+    info!("idling — health server keeps container alive");
     std::future::pending::<()>().await;
-    Ok(()) // unreachable at runtime
+    Ok(())
 }
 
 async fn run_job(cfg: &Arc<config::Config>) -> Result<()> {
-    // 1. Timestamp list (Jalali, hourly)
     let timestamps = timestamps::generate_hourly_timestamps(&cfg.start_date, &cfg.end_date)?;
     let total = timestamps.len();
     info!(count = total, "generated hourly timestamps");
 
-    // 2. Temp files
     let temp_dir = tempfile::tempdir()?;
     let jsonl_path = temp_dir.path().join("data.jsonl");
     let zst_path = temp_dir.path().join("data.jsonl.zst");
 
-    // 3. Writer task
     let (tx, mut rx) = mpsc::channel::<(String, Result<serde_json::Value>)>(256);
     let writer_path = jsonl_path.clone();
     let writer = tokio::spawn(async move {
@@ -91,7 +89,6 @@ async fn run_job(cfg: &Arc<config::Config>) -> Result<()> {
         Ok::<_, anyhow::Error>((succeeded, failures))
     });
 
-    // 4. Fetch
     let fetcher = Arc::new(Fetcher::new(cfg.fetch_max_retries, cfg.fetch_timeout_secs)?);
     fetcher
         .warm_up()
@@ -126,7 +123,6 @@ async fn run_job(cfg: &Arc<config::Config>) -> Result<()> {
     let (succeeded, failures) = writer.await.context("writer panicked")??;
     info!(succeeded, failed = failures.len(), "fetch phase done");
 
-    // 5. Compress
     info!("compressing with zstd");
     let jp = jsonl_path.clone();
     let zp = zst_path.clone();
@@ -141,7 +137,6 @@ async fn run_job(cfg: &Arc<config::Config>) -> Result<()> {
         "compressed"
     );
 
-    // 6. Upload
     let uploader = Uploader::new(
         &cfg.s3_endpoint,
         &cfg.s3_region,
@@ -163,7 +158,6 @@ async fn run_job(cfg: &Arc<config::Config>) -> Result<()> {
     info!(bucket = %cfg.s3_bucket, key = %key, "uploading");
     uploader.upload_file(&zst_path, &key).await?;
 
-    // 7. Optional temp-file preservation
     if cfg.keep_temp {
         std::fs::create_dir_all("aqms-out")?;
         std::fs::copy(&jsonl_path, "aqms-out/data.jsonl")?;
@@ -173,4 +167,44 @@ async fn run_job(cfg: &Arc<config::Config>) -> Result<()> {
 
     info!("done");
     Ok(())
+}
+
+/// HTTP server on $PORT. Answers 200 OK to every request so Runflare's
+/// health check passes. Starts immediately at boot, runs forever.
+async fn serve_health() {
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
+
+    let listener = match TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(l) => {
+            info!(port, "health server listening");
+            l
+        }
+        Err(e) => {
+            error!(port, error = %e, "failed to bind health port — container will likely restart");
+            return;
+        }
+    };
+
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, _)) => {
+                tokio::spawn(async move {
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\n\
+                              Content-Type: text/plain\r\n\
+                              Content-Length: 2\r\n\
+                              Connection: close\r\n\
+                              \r\nOK",
+                        )
+                        .await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+            Err(e) => warn!(error = %e, "health accept failed"),
+        }
+    }
 }
